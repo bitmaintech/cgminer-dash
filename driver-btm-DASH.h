@@ -4,6 +4,9 @@
 
 #include <poll.h>
 #include <termios.h>
+#include "miner.h"
+
+
 
 /******************** about D1 miner *********************/
 
@@ -15,8 +18,8 @@
 
 // default ticket mask
 
-#define DEVICE_DIFF_SET                 0x1D
-#define DEVICE_DIFF_SET_MASK            0x7
+#define DEVICE_DIFF_SET                 0x1B
+#define DEVICE_DIFF_SET_MASK            ((1 << (32 - DEVICE_DIFF_SET)) - 1)
 
 #define DEVICE_DIFF_STANDARD            0x16
 #define DEVICE_DIFF_STANDARD_MASK       0x003fffffull
@@ -41,11 +44,11 @@
 
 /****************** about D1 miner end *******************/
 
-#define JZ4775
+//#define JZ4775
 
 #ifdef JZ4775
-#define FAN0                    "84:"   // front fan
-#define FAN1                    "85:"   // back fan
+#define FAN0                    "110:"   // front fan
+#define FAN1                    "113:"   // back fan
 #define GPIO_DEVICE_TEMPLATE    "/sys/class/gpio/gpio%d/value"
 #define TTY_DEVICE_TEMPLATE     "/dev/ttyS%d"
 #define PWM_CTRL_TEMPLATE       "echo %u > /sys/class/pwm/pwmchip0/pwm1/duty_ns"
@@ -152,6 +155,7 @@
 #define MISC_CONTROL_DEFAULT_VALUE                  0x07003A01
 #define RFS                                         (0x1 << 14)
 #define TFS(X)                                      ((X & 0x03) << 5)
+#define BT8D(x)                                     (x << 8)
 
 // analog mux control
 #define DIODE_MUX_SEL_DEFAULT_VALUE                 4
@@ -302,6 +306,12 @@ struct init_config
     uint16_t    crc;
 } __attribute__((packed, aligned(4)));
 
+struct bitmain_DASH_info_with_index
+{
+    struct bitmain_DASH_info *info;
+    uint8_t chain_index;
+}__attribute__((packed, aligned(4)));
+
 struct bitmain_DASH_info
 {
     cglock_t    update_lock;
@@ -332,9 +342,8 @@ struct bitmain_DASH_info
     uint32_t    i2c_fd;
     struct work *work_queue[BITMAIN_MAX_QUEUE_NUM];     // store the latest works that sent to Hash boards
     struct thr_info *thr;
-    pthread_t read_nonce_thr;
-    pthread_t uart_tx_t[BITMAIN_MAX_CHAIN_NUM];
-    pthread_t uart_rx_t[BITMAIN_MAX_CHAIN_NUM];
+    struct thr_info uart_tx_t[BITMAIN_MAX_CHAIN_NUM];
+    struct thr_info uart_rx_t[BITMAIN_MAX_CHAIN_NUM];
     pthread_mutex_t lock;
 
     struct init_config DASH_config;
@@ -414,7 +423,7 @@ typedef struct
 
 struct dev_info
 {
-    uint8_t     dev_fd;
+    uint32_t     dev_fd;
     uint32_t    chainid;
 };
 

@@ -1327,6 +1327,20 @@ void thr_info_cancel(struct thr_info *thr)
     cgsem_destroy(&thr->sem);
 }
 
+void thr_info_join(struct thr_info *thr)
+{
+    if (!thr)
+        return;
+
+    if (PTH(thr) != 0L)
+    {
+        pthread_join(thr->pth, NULL);
+        PTH(thr) = 0L;
+    }
+    cgsem_destroy(&thr->sem);
+}
+
+
 void subtime(struct timeval *a, struct timeval *b)
 {
     timersub(a, b, b);

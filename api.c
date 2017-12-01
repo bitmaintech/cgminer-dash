@@ -2816,7 +2816,7 @@ static void summary(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __mayb
     root = api_add_elapsed(root, "Elapsed", &(total_secs), true);
 
 #if defined(USE_BITMAIN_C5) || defined(USE_BITMAIN_L3) || defined(USE_BITMAIN_D1)
-    root = api_add_string(root, "GHS 5s", displayed_hash_rate, false);
+    root = api_add_string(root, "GHS 5s", displayed_hash_rate, true);
 #else
     root = api_add_mhs(root, "GHS 5s", &(g_displayed_rolling), false);
 #endif
@@ -3489,7 +3489,7 @@ static int itemstats(struct io_data *io_data, int i, char *id, struct cgminer_st
 #endif
 
 #if defined(USE_BITMAIN_C5) || defined(USE_BITMAIN_L3) || defined(USE_BITMAIN_D1)
-    root = api_add_string(root, "GHS 5s", displayed_hash_rate, false);
+    root = api_add_string(root, "GHS 5s", displayed_hash_rate, true);
 #else
     root = api_add_mhs(root, "GHS 5s", &(g_displayed_rolling), false);
 #endif

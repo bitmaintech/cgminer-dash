@@ -177,6 +177,17 @@ if test "x$bitmain_L3" = xyes; then
 fi
 AM_CONDITIONAL([HAS_BITMAIN_L3], [test x$bitmain_L3 = xyes])
 
+
+bitmain_jz4775="no"
+
+AC_ARG_ENABLE([bitmain_jz4775],
+	[AC_HELP_STRING([--enable-bitmain-jz4775],[Compile support for Bitmain D1 jz4775(default disabled)])],
+	[bitmain_jz4775=$enableval]
+	)
+if test "x$bitmain_jz4775" = xyes; then
+	AC_DEFINE([JZ4775], [1], [Defined to 1 if jz4775 support is wanted])
+fi
+
 bitmain_D1="no"
 
 AC_ARG_ENABLE([bitmain_D1],

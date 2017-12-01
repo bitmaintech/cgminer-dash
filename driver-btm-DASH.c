@@ -39,11 +39,10 @@
 #endif
 
 #include "elist.h"
-#include "miner.h"
 //#include "usbutils.h"
-
-#include "util.h"
 #include "driver-btm-DASH.h"
+#include "util.h"
+
 
 
 /****************** checked ***************************/
@@ -54,7 +53,7 @@ int const beep = 20;
 int const red_led = 45;
 int const green_led = 23;
 int const fan_speed[BITMAIN_MAX_FAN_NUM] = {112,110};
-int const g_gpio_data[BITMAIN_MAX_CHAIN_NUM] = {5, 4, 27, 22}; 
+int const g_gpio_data[BITMAIN_MAX_CHAIN_NUM] = {5, 4, 27, 22};
 #else
 int const plug[BITMAIN_MAX_CHAIN_NUM] = {184,185,187,186};
 int const tty[BITMAIN_MAX_CHAIN_NUM] = {0,1,2,3};
@@ -62,10 +61,12 @@ int const beep = 81;
 int const red_led = 126;
 int const green_led = 127;
 int const fan_speed[BITMAIN_MAX_FAN_NUM] = {38,41};
-int const g_gpio_data[BITMAIN_MAX_CHAIN_NUM] = {192, 193, 194, 195}; 
+int const g_gpio_data[BITMAIN_MAX_CHAIN_NUM] = {192, 193, 194, 195};
 #endif
+unsigned char bt8d = 0x1a;
 int const i2c_slave_addr[BITMAIN_MAX_CHAIN_NUM] = {0xa0,0xa2,0xa4,0xa6};
 
+pthread_mutex_t reinit_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t i2c_mutex = PTHREAD_MUTEX_INITIALIZER;  // used when cpu operates i2c interface
 pthread_mutex_t iic_mutex = PTHREAD_MUTEX_INITIALIZER;  // used when cpu communicate with pic
 pthread_mutex_t reg_read_mutex = PTHREAD_MUTEX_INITIALIZER;     // used when read ASIC register periodic in pthread
@@ -125,6 +126,9 @@ unsigned char gMinerStatus_High_Temp_Counter = 0;           // the temperature i
 
 struct thr_info *read_nonce_reg_id;                 // thread id for read nonce and register
 uint64_t h = 0;
+uint64_t h_each_chain[BITMAIN_MAX_CHAIN_NUM] = {0};
+double each_chain_h_avg[BITMAIN_MAX_CHAIN_NUM] = {0};
+double geach_chain_h_all = 0;
 unsigned char hash_board_id[BITMAIN_MAX_CHAIN_NUM][12];
 unsigned char voltage[BITMAIN_MAX_CHAIN_NUM] = {0,0,0,0};
 bool need_recheck = false;
@@ -132,7 +136,11 @@ pthread_mutex_t reg_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t nonce_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t tty_write_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_mutex_t temp_buf_mutex = PTHREAD_MUTEX_INITIALIZER;
-static bool start_send = false;
+static bool start_send[BITMAIN_MAX_CHAIN_NUM] = {false,false,false,false};
+static bool start_recv[BITMAIN_MAX_CHAIN_NUM] = {false,false,false,false};
+static bool reiniting[BITMAIN_MAX_CHAIN_NUM] = {false,false,false,false};
+
+
 bool once_error = false;
 bool status_error = false;
 bool check_rate = false;
@@ -1722,10 +1730,10 @@ void every_chain_set_voltage_PIC16F1704_new(unsigned short voltage)
 {
     unsigned char which_chain;
 
-	double temp_voltage = 1609.927422-182.739369*(voltage)/100;
-	uint8_t pic_voltage1 = (uint8_t)temp_voltage;
-	applog(LOG_NOTICE,"set voltage = %.6f  real:%u mv\n", temp_voltage, voltage);
-	
+    double temp_voltage = 1609.927422-182.739369*(voltage)/100;
+    uint8_t pic_voltage1 = (uint8_t)temp_voltage;
+    applog(LOG_NOTICE,"set voltage = %.6f  real:%u mv\n", temp_voltage, voltage);
+
     for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
     {
         if(dev.chain_exist[which_chain] == 1)
@@ -1745,8 +1753,8 @@ void every_chain_get_voltage_PIC16F1704_new(unsigned short voltage)
 {
     unsigned char which_chain;
 
-	uint8_t pic_voltage1;
-	
+    uint8_t pic_voltage1;
+
     for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
     {
         if(dev.chain_exist[which_chain] == 1)
@@ -1755,7 +1763,7 @@ void every_chain_get_voltage_PIC16F1704_new(unsigned short voltage)
             if(unlikely(ioctl(dev.i2c_fd,I2C_SLAVE,i2c_slave_addr[which_chain] >> 1 ) < 0))
                 applog(LOG_ERR, "ioctl error @ line %d",__LINE__);
             get_PIC16F1704_voltage_new(&pic_voltage1);
-			applog(LOG_NOTICE,"Chain %u voltage %u",which_chain,pic_voltage1);
+            applog(LOG_NOTICE,"Chain %u voltage %u",which_chain,pic_voltage1);
             pthread_mutex_unlock(&iic_mutex);
         }
         cgsleep_ms(100);
@@ -2132,33 +2140,38 @@ inline void set_address(int const which_chain, unsigned char chip_addr)
 }
 
 
-void software_set_address()
+void software_set_address_chain(unsigned int which_chain)
 {
-    unsigned int which_chain, which_asic, which_sensor;
-
+    unsigned int which_asic, which_sensor;
+    applog(LOG_NOTICE,"%s: chain %d has %d ASIC, and addrInterval is %d", __FUNCTION__, which_chain, dev.chain_asic_num[which_chain], dev.addrInterval);
     // set ASIC's address, and CHIP_OFFSET / CORE_OFFSET register
-    for(which_chain=0; which_chain<BITMAIN_MAX_CHAIN_NUM; which_chain++)
+    if(dev.chain_exist[which_chain] == 1 /*&& dev.chain_asic_num[i] == CHAIN_ASIC_NUM*/)
     {
-        applog(LOG_NOTICE,"%s: chain %d has %d ASIC, and addrInterval is %d", __FUNCTION__, which_chain, dev.chain_asic_num[which_chain], dev.addrInterval);
-        if(dev.chain_exist[which_chain] == 1 /*&& dev.chain_asic_num[i] == CHAIN_ASIC_NUM*/)
+        chain_inactive(which_chain);
+        cgsleep_ms(30);
+
+        applog(LOG_NOTICE, "Now Set [%d] Chain Address", which_chain);
+        for(which_asic = 0; which_asic < ASIC_NUM_EACH_CHAIN; which_asic++)
         {
-            chain_inactive(which_chain);
-            cgsleep_ms(30);
-
-            applog(LOG_NOTICE, "Now Set [%d] Chain Address", which_chain);
-            for(which_asic = 0; which_asic < ASIC_NUM_EACH_CHAIN; which_asic++)
-            {
-                set_address(which_chain, which_asic * dev.addrInterval);
-                cgsleep_ms(10);
-            }
-
-            set_config(dev.dev_fd[which_chain], 1, 0, CHIP_OFFSET, gChipOffset);
-            cgsleep_ms(10);
-            set_config(dev.dev_fd[which_chain], 1, 0, CORE_OFFSET, gCoreOffset);
+            set_address(which_chain, which_asic * dev.addrInterval);
             cgsleep_ms(10);
         }
-    }
 
+        set_config(dev.dev_fd[which_chain], 1, 0, CHIP_OFFSET, gChipOffset);
+        cgsleep_ms(10);
+        set_config(dev.dev_fd[which_chain], 1, 0, CORE_OFFSET, gCoreOffset);
+        cgsleep_ms(10);
+    }
+}
+
+
+void software_set_address()
+{
+    unsigned int which_chain;
+    for(which_chain=0; which_chain<BITMAIN_MAX_CHAIN_NUM; which_chain++)
+    {
+        software_set_address_chain(which_chain);
+    }
     cgsleep_ms(10);
 }
 
@@ -2186,27 +2199,42 @@ static void get_plldata(unsigned int freq, unsigned int *vil_data)
 }
 
 
-void set_frequency(unsigned int frequency)
+void set_frequency_chain(unsigned char which_chain,unsigned int frequency)
 {
-    unsigned char which_chain;
     unsigned int freq_data = 0;
-
     get_plldata(frequency, &freq_data);
-    applog(LOG_NOTICE, "%s: frequency = %d", __FUNCTION__, frequency);
 
-    for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
+    if(dev.chain_exist[which_chain] == 1)
     {
-        if(dev.chain_exist[which_chain] == 1)
-        {
-            set_config(dev.dev_fd[which_chain], 1, 0, PLL_PARAMETER, freq_data);
-            dev.freq[which_chain] = frequency;
-            cgsleep_us(10000);
-        }
+        set_config(dev.dev_fd[which_chain], 1, 0, PLL_PARAMETER, freq_data);
+        dev.freq[which_chain] = frequency;
+        cgsleep_us(10000);
     }
 
     cgsleep_ms(10);
 }
 
+
+void set_frequency(unsigned int frequency)
+{
+    unsigned char which_chain;
+    applog(LOG_NOTICE, "%s: frequency = %d", __FUNCTION__, frequency);
+    for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
+    {
+        set_frequency_chain(which_chain, frequency);
+    }
+    cgsleep_ms(10);
+}
+
+
+void set_ticket_mask_chain(unsigned char which_chain, unsigned int ticket_mask)
+{
+    if(dev.chain_exist[which_chain] == 1)
+    {
+        set_config(dev.dev_fd[which_chain], 1, 0, TICK_MASK, ticket_mask);
+        cgsleep_ms(5);
+    }
+}
 
 void set_ticket_mask(unsigned int ticket_mask)
 {
@@ -2216,12 +2244,7 @@ void set_ticket_mask(unsigned int ticket_mask)
 
     for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
     {
-        if(dev.chain_exist[which_chain] == 1)
-        {
-            set_config(dev.dev_fd[which_chain], 1, 0, TICK_MASK, ticket_mask);
-            cgsleep_ms(5);
-            //check_asic_reg(which_chain, 1, 0, TICK_MASK);
-        }
+        set_ticket_mask_chain(which_chain, ticket_mask);
     }
 }
 
@@ -2238,11 +2261,11 @@ int is_nonce_or_reg_value(unsigned char data)
     }
 }
 
+void open_core_chain(unsigned int which_chain)
 
-void open_core(void)
 {
     unsigned int reg_value = 0x0;
-    unsigned int which_chain = 0, which_core = 0;
+    unsigned which_core = 0;
     struct work_dash null_work;
 
     applog(LOG_NOTICE, "%s", __FUNCTION__);
@@ -2252,27 +2275,31 @@ void open_core(void)
     null_work.wc = 0x7f;
     null_work.crc16 = Swap16(CRC16(0xffff, (unsigned char *)(&null_work), WORK_INPUT_LENGTH_WITHOUT_CRC));
 
-    for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
+    if(dev.chain_exist[which_chain] == 1)
     {
-        if(dev.chain_exist[which_chain] == 1)
-        {
-            reg_value = 0;
+        reg_value = 0;
 
-            for(which_core=0; which_core < dev.corenum; which_core++)
-            {
-                reg_value = (reg_value << 1) | 0x00000001;
-                set_config(dev.dev_fd[which_chain], 1, 0, CORE_ENABLE, reg_value);
-                cgsleep_ms(50);
-                DASH_write(dev.dev_fd[which_chain], &null_work, WORK_INPUT_LENGTH_WITH_CRC);
-                cgsleep_ms(200);
-                //applog(LOG_DEBUG, "%s: chain%d core%d reg_value=0x%08x", __FUNCTION__, which_chain, which_core, reg_value);
-            }
+        for(which_core=0; which_core < dev.corenum; which_core++)
+        {
+            reg_value = (reg_value << 1) | 0x00000001;
+            set_config(dev.dev_fd[which_chain], 1, 0, CORE_ENABLE, reg_value);
+            cgsleep_ms(5);
+            DASH_write(dev.dev_fd[which_chain], &null_work, WORK_INPUT_LENGTH_WITH_CRC);
+            cgsleep_ms(10);
+            //applog(LOG_DEBUG, "%s: chain%d core%d reg_value=0x%08x", __FUNCTION__, which_chain, which_core, reg_value);
         }
     }
-
     applog(LOG_DEBUG, "%s end", __FUNCTION__);
 }
 
+void open_core(void)
+{
+    unsigned int which_chain = 0;
+    for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
+    {
+        open_core_chain(which_chain);
+    }
+}
 
 void init_asic_display_status()
 {
@@ -2497,88 +2524,155 @@ speed_t tiospeed_t(int baud)
     }
 }
 
+
+int open_uart(struct bitmain_DASH_info *info, uint8_t which_chain)
+{
+    char dev_fname[PATH_MAX] = "";
+    sprintf(dev_fname, TTY_DEVICE_TEMPLATE, tty[which_chain]);
+    info->dev_fd[which_chain] = open(dev_fname, O_RDWR|O_NOCTTY);
+    if(info->dev_fd[which_chain] < 0)
+    {
+        applog(LOG_ERR, "%s : open %s failed", __FUNCTION__, dev_fname);
+    }
+    return info->dev_fd[which_chain];
+}
+
+int uart_init(struct bitmain_DASH_info *info,uint8_t which_chain, int baud)
+{
+    int i,ret;
+    speed_t speed;
+    struct termios options;
+
+    tcgetattr(info->dev_fd[which_chain], &options);
+    speed = tiospeed_t(baud);
+    if (speed == B0)
+    {
+        applog(LOG_WARNING, "Unrecognized baud rate: %d,set default baud", baud);
+        speed = B115200;
+    }
+    cfsetispeed(&options,speed);
+    cfsetospeed(&options,speed);
+
+    options.c_cflag &= ~(CSIZE | PARENB);
+    options.c_cflag |= CS8;
+    options.c_cflag |= CREAD;
+    options.c_cflag |= CLOCAL;
+
+    options.c_iflag &= ~(IGNBRK | BRKINT | PARMRK |
+                         ISTRIP | INLCR | IGNCR | ICRNL | IXON);
+    options.c_oflag &= ~OPOST;
+    options.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    options.c_cc[VTIME] = 0;
+    options.c_cc[VMIN] = C_CC_VMIN;
+    tcsetattr(info->dev_fd[which_chain], TCSANOW, &options);
+
+    tcflush(info->dev_fd[which_chain], TCIOFLUSH);
+
+}
+
+void tty_init_chain(uint8_t which_chain, struct bitmain_DASH_info *info, int baud)
+{
+    int ret;
+
+    applog(LOG_NOTICE, "%s",__FUNCTION__);
+
+    if(info->chain_status[which_chain] == 1)
+    {
+        open_uart(info, which_chain);
+        uart_init(info,which_chain,115200);
+
+        if(baud != 115200)
+        {
+            switch(baud)
+            {
+                case 3000000:
+                    bt8d = 0;
+                    break;
+
+                case 1500000:
+                    bt8d = 1;
+                    break;
+
+                case 921600:
+                    bt8d = 2;
+                    break;
+
+                case 460800:
+                    bt8d = 6;
+                    break;
+
+                case 115200:
+                    bt8d = 26;
+                    break;
+
+                default:
+                    bt8d = 26;
+                    printf("%s: the baud is not recommand value, so use 115200 baud\n", __FUNCTION__);
+                    break;
+            }
+            unsigned int gMisc_Control_reg_value = 0x07003a01;
+            gMisc_Control_reg_value = gMisc_Control_reg_value & 0xFFFFE0FF | BT8D(bt8d);
+            set_config(info->dev_fd[which_chain],1, 0, MISC_CONTROL, gMisc_Control_reg_value);
+            //check_asic_reg(which_chain,1,0,unsigned char MISC_CONTROL);
+
+            close(info->dev_fd[which_chain]);
+
+            open_uart(info, which_chain);
+            uart_init(info,which_chain,baud);
+        }
+
+        dev_info[which_chain].chainid = which_chain;
+        dev_info[which_chain].dev_fd = info->dev_fd[which_chain];
+        applog(LOG_NOTICE, "%s chainid = %d",__FUNCTION__,dev_info[which_chain].chainid);
+
+        start_recv[which_chain] = true;
+        ret = thr_info_create(&info->uart_rx_t[which_chain], NULL, get_asic_response, (void *)&dev_info[which_chain]);
+        if(unlikely(ret != 0))
+        {
+            applog(LOG_ERR,"create rx read thread for chain %d failed", which_chain);
+        }
+        else
+        {
+            applog(LOG_ERR,"create rx read thread for chain %d ok", which_chain);
+        }
+
+        cgsleep_ms(50);
+        struct bitmain_DASH_info_with_index info_with_index;
+        info_with_index.info = info;
+        info_with_index.chain_index = which_chain;
+        ret = thr_info_create(&info->uart_tx_t[which_chain], NULL, DASH_fill_work, (void *)(&info_with_index));
+        cgsleep_ms(200);
+        if(unlikely(ret != 0))
+        {
+            applog(LOG_ERR,"create tx read thread for chain %d failed",which_chain);
+        }
+        else
+        {
+            applog(LOG_ERR,"create tx read thread for chain %d ok",which_chain);
+        }
+    }
+
+    applog(LOG_NOTICE,"open device over");
+
+
+    dev.dev_fd[which_chain] = info->dev_fd[which_chain];
+
+    cgsleep_ms(10);
+}
+
+
 void tty_init(struct bitmain_DASH_info *info, int baud)
 {
-    int which_chain = 0,ret;
-    char dev_fname[PATH_MAX] = "";
-    struct termios options;
+    uint8_t which_chain = 0,ret;
 
     applog(LOG_NOTICE, "%s",__FUNCTION__);
 
     for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
     {
-        if(info->chain_status[which_chain] == 1)
-        {
-            sprintf(dev_fname, TTY_DEVICE_TEMPLATE, tty[which_chain]);
-            info->dev_fd[which_chain] = open(dev_fname, O_RDWR|O_NOCTTY);
-            if(info->dev_fd[which_chain] < 0)
-            {
-                applog(LOG_ERR, "%s : open %s failed", __FUNCTION__, dev_fname);
-            }
-
-            tcgetattr(info->dev_fd[which_chain], &options);
-            speed_t speed = tiospeed_t(baud);
-            if (speed == B0)
-            {
-                applog(LOG_WARNING, "Unrecognized baud rate: %d,set default baud", baud);
-                speed = B115200;
-            }
-            cfsetispeed(&options,speed);
-            cfsetospeed(&options,speed);
-
-            options.c_cflag &= ~(CSIZE | PARENB);
-            options.c_cflag |= CS8;
-            options.c_cflag |= CREAD;
-            options.c_cflag |= CLOCAL;
-
-            options.c_iflag &= ~(IGNBRK | BRKINT | PARMRK |
-                                 ISTRIP | INLCR | IGNCR | ICRNL | IXON);
-            options.c_oflag &= ~OPOST;
-            options.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
-            options.c_cc[VTIME] = 0;
-            options.c_cc[VMIN] = C_CC_VMIN;
-            tcsetattr(info->dev_fd[which_chain], TCSANOW, &options);
-
-            tcflush(info->dev_fd[which_chain], TCIOFLUSH);
-
-            info->chain_index = dev_info[which_chain].chainid = which_chain;
-            dev_info[which_chain].dev_fd = info->dev_fd[which_chain];
-            applog(LOG_NOTICE, "%s chainid = %d",__FUNCTION__,dev_info[which_chain].chainid);
-
-            ret = pthread_create(&info->uart_rx_t[which_chain], NULL, get_asic_response, (void *)&dev_info[which_chain]);
-            if(unlikely(ret != 0))
-            {
-                applog(LOG_ERR,"create rx read thread for %s failed", dev_fname);
-            }
-            else
-            {
-                applog(LOG_ERR,"create rx read thread for %s ok", dev_fname);
-            }
-
-            cgsleep_ms(50);
-
-            ret = pthread_create(&info->uart_tx_t[which_chain], NULL, DASH_fill_work, (void *)info);
-            cgsleep_ms(200);
-            if(unlikely(ret != 0))
-            {
-                applog(LOG_ERR,"create tx read thread for %s failed",dev_fname);
-            }
-            else
-            {
-                applog(LOG_ERR,"create tx read thread for %s ok",dev_fname);
-            }
-        }
+        tty_init_chain(which_chain, info, baud);
     }
-    applog(LOG_NOTICE,"open device over");
-
-    for (which_chain=0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++ )
-    {
-        dev.dev_fd[which_chain] = info->dev_fd[which_chain];
-    }
-
     cgsleep_ms(10);
 }
-
 
 int DASH_write(int fd, const void *buf, size_t bufLen)
 {
@@ -3013,7 +3107,7 @@ int bitmain_DASH_init(struct bitmain_DASH_info *info)
 
     memcpy(&config_parameter, &config, sizeof(struct init_config));
 
-    sprintf(g_miner_version, "1.0.0.7");
+    sprintf(g_miner_version, "1.0.0.9");
     dev.addrInterval = 1;
     // start fans
 
@@ -3065,9 +3159,11 @@ int bitmain_DASH_init(struct bitmain_DASH_info *info)
     every_chain_enable_PIC16F1704_dc_dc_new();
     reset_all_hash_board();
     tty_init(info, config_parameter.baud);
-    clear_register_value_buf();
     cgsleep_ms(100);
     ret = creat_bitmain_scanreg_pthread();
+    cgsleep_ms(100);
+    clear_register_value_buf();
+
     if(ret == -4)
     {
         return ret;
@@ -3197,10 +3293,57 @@ int bitmain_DASH_init(struct bitmain_DASH_info *info)
     }
     // init ASIC status which will be display on the web
     init_asic_display_status();
-
-    start_send = true;
+    for(i = 0; i < BITMAIN_MAX_CHAIN_NUM; i++)
+        start_send[i] = true;
 
     return 0;
+}
+
+
+void* bitmain_DASH_reinit_chain(void * usrdata )
+{
+    pthread_detach(pthread_self());
+    pthread_mutex_lock(&reinit_mutex);
+    struct bitmain_DASH_info_with_index *info_with_chain = (struct bitmain_DASH_info_with_index *)usrdata;
+    struct bitmain_DASH_info *info = info_with_chain->info;
+    uint8_t chain = info_with_chain->chain_index;
+
+    pthread_mutex_lock(&iic_mutex);
+    if(unlikely(ioctl(dev.i2c_fd,I2C_SLAVE,i2c_slave_addr[chain] >> 1 ) < 0))
+        applog(LOG_ERR,"ioctl error @ line %d",__LINE__);
+    disable_PIC16F1704_dc_dc_new();
+    pthread_mutex_unlock(&iic_mutex);
+
+    start_send[chain] = false;
+    start_recv[chain] = false;
+    reiniting[chain] = true;
+    cgsleep_ms(10);
+    thr_info_join(&info->uart_tx_t[chain]);
+    thr_info_join(&info->uart_rx_t[chain]);
+    sleep(1);
+
+    pthread_mutex_lock(&iic_mutex);
+    if(unlikely(ioctl(dev.i2c_fd,I2C_SLAVE,i2c_slave_addr[chain] >> 1 ) < 0))
+        applog(LOG_ERR,"ioctl error @ line %d",__LINE__);
+    enable_PIC16F1704_dc_dc_new();
+    pthread_mutex_unlock(&iic_mutex);
+
+    sleep(1);
+    reset_hash_board(chain);
+    flock(dev.dev_fd[chain],LOCK_EX);
+    close(dev.dev_fd[chain]);
+    flock(dev.dev_fd[chain],LOCK_UN);
+    reiniting[chain] = false;
+    tty_init_chain(chain,info, BITMAIN_DEFAULT_BAUD);
+    software_set_address_chain(chain);
+    set_ticket_mask_chain(chain,DEVICE_DIFF_SET);
+    enable_read_temperature_from_asic_chain(chain,MISC_CONTROL_DEFAULT_VALUE);
+    select_core_to_check_temperature_chain(chain,DIODE_MUX_SEL_DEFAULT_VALUE, VDD_MUX_SEL_DEFAULT_VALUE);
+    set_temperature_offset_value_chain(chain);
+    set_frequency_chain(chain, dev.frequency);
+    open_core_chain(chain);
+    start_send[chain] = true;
+    pthread_mutex_unlock(&reinit_mutex);
 }
 
 
@@ -3261,7 +3404,8 @@ int bitmain_DASH_reinit(struct bitmain_DASH_info *info)
     // init ASIC status which will be display on the web
     init_asic_display_status();
 
-    start_send = true;
+    for(i = 0; i < BITMAIN_MAX_CHAIN_NUM; i++)
+        start_send[i] = true;
 
     return 0;
 }
@@ -3271,44 +3415,65 @@ int bitmain_DASH_reinit(struct bitmain_DASH_info *info)
 #define TEMPERATURE_SENSOR
 /****************** about temperature sensor ******************/
 
-void enable_read_temperature_from_asic(unsigned int misc_control_reg_value)
-{
-    unsigned int which_chain=0, which_sensor=0, reg_value = 0;
 
-    reg_value = misc_control_reg_value | RFS | TFS(3);
+void enable_read_temperature_from_asic_chain(unsigned int which_chain, unsigned int misc_control_reg_value)
+{
+    unsigned int which_sensor=0, reg_value = 0;
+
+    reg_value = ((misc_control_reg_value | RFS | TFS(3)) & 0xFFFFE0FF) | BT8D(bt8d);
 
     applog(LOG_NOTICE, "%s: reg_value = 0x%08x", __FUNCTION__, reg_value);
 
-    for (which_chain=0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
+
+    if ( dev.chain_exist[which_chain] == 1)
     {
-        if ( dev.chain_exist[which_chain] == 1)
+        for (which_sensor = 0 ; which_sensor < BITMAIN_REAL_TEMP_CHIP_NUM; which_sensor++)
         {
-            for (which_sensor = 0 ; which_sensor < BITMAIN_REAL_TEMP_CHIP_NUM; which_sensor++)
-            {
-                set_config(dev.dev_fd[which_chain], 0, TempChipAddr[which_sensor], MISC_CONTROL, reg_value);
-                cgsleep_ms(2);
-            }
+            set_config(dev.dev_fd[which_chain], 0, TempChipAddr[which_sensor], MISC_CONTROL, reg_value);
+            cgsleep_ms(2);
         }
     }
+
+}
+
+void enable_read_temperature_from_asic(unsigned int misc_control_reg_value)
+{
+    unsigned int which_chain=0;
+
+    for (which_chain=0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
+    {
+        enable_read_temperature_from_asic_chain(which_chain, misc_control_reg_value);
+    }
+}
+
+void select_core_to_check_temperature_chain(unsigned int which_chain, unsigned char diode_mux_sel, unsigned char vdd_mux_sel)
+{
+    unsigned int which_sensor=0;
+    unsigned int regdata = ((diode_mux_sel & 0x0f) << 16) | (vdd_mux_sel & 0x1f);
+
+    applog(LOG_NOTICE, "%s: diode_mux_sel = %d, vdd_mux_sel = %d", __FUNCTION__, diode_mux_sel, vdd_mux_sel);
+
+
+    if ( dev.chain_exist[which_chain] == 1)
+    {
+        for (which_sensor = 0 ; which_sensor < BITMAIN_REAL_TEMP_CHIP_NUM; which_sensor++)
+        {
+            set_config(dev.dev_fd[which_chain], 0, TempChipAddr[which_sensor], ANALOG_MUX_CONTROL, regdata);
+            cgsleep_ms(2);
+        }
+    }
+
 }
 
 void select_core_to_check_temperature(unsigned char diode_mux_sel, unsigned char vdd_mux_sel)
 {
-    unsigned int which_chain=0, which_sensor=0;
-    unsigned int regdata = ((diode_mux_sel & 0x0f) << 16) | (vdd_mux_sel & 0x1f);
+    unsigned int which_chain=0;
 
     applog(LOG_NOTICE, "%s: diode_mux_sel = %d, vdd_mux_sel = %d", __FUNCTION__, diode_mux_sel, vdd_mux_sel);
 
     for (which_chain=0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
     {
-        if ( dev.chain_exist[which_chain] == 1)
-        {
-            for (which_sensor = 0 ; which_sensor < BITMAIN_REAL_TEMP_CHIP_NUM; which_sensor++)
-            {
-                set_config(dev.dev_fd[which_chain], 0, TempChipAddr[which_sensor], ANALOG_MUX_CONTROL, regdata);
-                cgsleep_ms(2);
-            }
-        }
+        select_core_to_check_temperature_chain(which_chain, diode_mux_sel, vdd_mux_sel);
     }
 }
 
@@ -3328,59 +3493,102 @@ void read_i2c_reg(unsigned char which_chain, unsigned char which_sensor, unsigne
     while((!g_chip_temp_return[which_chain][which_sensor][reg_type]) && (read_temperature_time < READ_LOOP));
 
 }
-void calibration_sensor_offset(void)
+void calibration_sensor_offset_chain(unsigned char which_chain)
 {
-    unsigned char which_chain, which_sensor;
-    //applog(LOG_NOTICE, "%s", __FUNCTION__);
+    unsigned char which_sensor, cali_times = 0;
+    applog(LOG_NOTICE, "%d %s", which_chain, __FUNCTION__);
 
-    for ( which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++ )
+    if ( dev.chain_exist[which_chain] == 1 )
     {
-        if ( dev.chain_exist[which_chain] == 1 )
+        for (which_sensor = 0 ; which_sensor < BITMAIN_REAL_TEMP_CHIP_NUM; which_sensor++ )
         {
-            for (which_sensor = 0 ; which_sensor < BITMAIN_REAL_TEMP_CHIP_NUM; which_sensor++ )
+        	cali_times = 0;
+            do
             {
                 read_i2c_reg(which_chain,which_sensor,REMOTE,REGADDRVALID | DEVICEADDR(TMP451_IIC_SALVE_ADDR) | REGADDR(EXT_TEMP_VALUE_HIGH_BYTE) | DATA(0) & (~RW));
                 read_i2c_reg(which_chain,which_sensor,LOCAL,REGADDRVALID | DEVICEADDR(TMP451_IIC_SALVE_ADDR) | REGADDR(LOCAL_TEMP_VALUE) | DATA(0) & (~RW));
                 // record temperature offset value
-                gTempOffsetValue[which_chain][which_sensor] = dev.chain_asic_temp[which_chain][which_sensor][LOCAL] - dev.chain_asic_temp[which_chain][which_sensor][REMOTE];
-            }
+                applog(LOG_NOTICE,"chain:%d local:%d remote:%d",which_chain, dev.chain_asic_temp[which_chain][which_sensor][LOCAL], dev.chain_asic_temp[which_chain][which_sensor][REMOTE]);
+                gTempOffsetValue[which_chain][which_sensor] += dev.chain_asic_temp[which_chain][which_sensor][LOCAL] - dev.chain_asic_temp[which_chain][which_sensor][REMOTE];
+                set_temperature_offset_value_chain_sensor(which_chain, which_sensor);
+			}
+            while((abs(dev.chain_asic_temp[which_chain][which_sensor][LOCAL] - dev.chain_asic_temp[which_chain][which_sensor][REMOTE]) > 2) && (cali_times++ < 10));
         }
     }
 }
 
-void set_temperature_offset_value(void)
+void calibration_sensor_offset(void)
 {
-    unsigned char which_chain, which_sensor, read_temperature_time;
+    unsigned char which_chain;
+    //applog(LOG_NOTICE, "%s", __FUNCTION__);
+    for ( which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++ )
+    {
+        if ( dev.chain_exist[which_chain] == 1 )
+        {
+            calibration_sensor_offset_chain(which_chain);
+        }
+    }
+}
+
+void set_temperature_offset_value_chain_sensor(unsigned char which_chain, unsigned char which_sensor)
+{
+    unsigned char read_temperature_time;
     signed char local_temp=0, remote_temp=0, offset=0;
     unsigned int reg_data = 0, ret = 0;
     bool not_read_out_temperature = false;
 
-    applog(LOG_WARNING, "%s", __FUNCTION__);
+    applog(LOG_WARNING, "Chain %d %s", which_chain, __FUNCTION__);
+
+
+    // write the offset value into GENERAL_I2C_COMMAND register to send to temperature sensor
+    reg_data = 0x000000ff & DATA(gTempOffsetValue[which_chain][which_sensor]);
+    reg_data |= REGADDRVALID | DEVICEADDR(TMP451_IIC_SALVE_ADDR) | REGADDR(EXT_TEMP_OFFSET_HIGH_BYTE) | RW;
+    read_i2c_reg(which_chain,which_sensor,OFFSET,reg_data);
+
+    reg_data = REGADDRVALID | DEVICEADDR(TMP451_IIC_SALVE_ADDR) | REGADDR(EXT_TEMP_OFFSET_HIGH_BYTE) | DATA(0) & (~RW);
+    read_i2c_reg(which_chain,which_sensor,OFFSET,reg_data);
+
+    if(send_back_gTempOffsetValue[which_chain][which_sensor] != gTempOffsetValue[which_chain][which_sensor])
+    {
+        applog(LOG_ERR, "%s: Chain%d Sensor%d temp offset value set error. It should be %02d, but read back is %02d\n",
+               __FUNCTION__, which_chain, which_sensor, gTempOffsetValue[which_chain][which_sensor], send_back_gTempOffsetValue[which_chain][which_sensor]);
+    }
+    else
+    {
+        applog(LOG_NOTICE, "%s: Chain%d Sensor%d temp offset : %02d, ",__FUNCTION__, which_chain, which_sensor, send_back_gTempOffsetValue[which_chain][which_sensor]);
+    }
+}
+
+
+void set_temperature_offset_value_chain(unsigned char which_chain)
+{
+    unsigned char which_sensor, read_temperature_time;
+    signed char local_temp=0, remote_temp=0, offset=0;
+    unsigned int reg_data = 0, ret = 0;
+    bool not_read_out_temperature = false;
+
+    applog(LOG_WARNING, "Chain %d %s", which_chain, __FUNCTION__);
+
+    if ( dev.chain_exist[which_chain] == 1 )
+    {
+        for (which_sensor = 0 ; which_sensor < BITMAIN_REAL_TEMP_CHIP_NUM; which_sensor++ )
+        {
+            // write the offset value into GENERAL_I2C_COMMAND register to send to temperature sensor
+            set_temperature_offset_value_chain_sensor(which_chain, which_sensor);
+        }
+    }
+}
+
+
+void set_temperature_offset_value(void)
+{
+    unsigned char which_chain;
 
     for ( which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++ )
     {
         if ( dev.chain_exist[which_chain] == 1 )
         {
-            for (which_sensor = 0 ; which_sensor < BITMAIN_REAL_TEMP_CHIP_NUM; which_sensor++ )
-            {
-                // write the offset value into GENERAL_I2C_COMMAND register to send to temperature sensor
-                reg_data = 0x000000ff & DATA(gTempOffsetValue[which_chain][which_sensor]);
-                reg_data |= REGADDRVALID | DEVICEADDR(TMP451_IIC_SALVE_ADDR) | REGADDR(EXT_TEMP_OFFSET_HIGH_BYTE) | RW;
-                read_i2c_reg(which_chain,which_sensor,OFFSET,reg_data);
-
-                reg_data = REGADDRVALID | DEVICEADDR(TMP451_IIC_SALVE_ADDR) | REGADDR(EXT_TEMP_OFFSET_HIGH_BYTE) | DATA(0) & (~RW);
-                read_i2c_reg(which_chain,which_sensor,OFFSET,reg_data);
-
-                if(send_back_gTempOffsetValue[which_chain][which_sensor] != gTempOffsetValue[which_chain][which_sensor])
-                {
-                    applog(LOG_ERR, "%s: Chain%d Sensor%d temp offset value set error. It should be %02d, but read back is %02d\n",
-                           __FUNCTION__, which_chain, which_sensor, gTempOffsetValue[which_chain][which_sensor], send_back_gTempOffsetValue[which_chain][which_sensor]);
-                }
-                else
-                {
-                    applog(LOG_NOTICE, "%s: Chain%d Sensor%d temp offset : %02d, ",__FUNCTION__, which_chain, which_sensor, send_back_gTempOffsetValue[which_chain][which_sensor]);
-                }
-            }
+            set_temperature_offset_value_chain(which_chain);
         }
     }
 }
@@ -3643,13 +3851,14 @@ void *bitmain_scanhash(void *arg)
 
             if(submitnonceok)
             {
-                h += 0x1UL << (DEVICE_DIFF_SET- DEVICE_DIFF_STANDARD);
+                h_each_chain[chain_id]++;
+                h += 0x1UL << (DEVICE_DIFF_SET - DEVICE_DIFF_STANDARD);
                 which_asic_nonce = ((Swap32(nonce) & 0xFC000000) >> 26) / dev.addrInterval;
                 applog(LOG_DEBUG,"%s: chain %d which_asic_nonce %d ", __FUNCTION__, chain_id, which_asic_nonce);
 
                 if (( chain_id > BITMAIN_MAX_CHAIN_NUM ) || (!dev.chain_exist[chain_id]))
                 {
-                    applog(LOG_ERR, "ChainID Cause Error! ChainID:[%d]", chain_id);
+                    applog(LOG_ERR, "ChainID Cause Error! ChainID:[%d] %d", chain_id,dev.chain_exist[chain_id]);
                     goto crc_error;
                 }
 
@@ -3881,6 +4090,8 @@ void *check_miner_status(void *arg)
     unsigned int which_chain, which_asic, which_sensor;
     unsigned int offset = 0;
     int fan_ret = 0;
+    struct bitmain_DASH_info_with_index info_with_index[BITMAIN_MAX_CHAIN_NUM];
+    pthread_t reinit_id[BITMAIN_MAX_CHAIN_NUM];
 
     while(1)
     {
@@ -3955,21 +4166,20 @@ void *check_miner_status(void *arg)
                     if ( ( which_asic + offset ) > (ASIC_NUM_EACH_CHAIN + 16) )
                         applog(LOG_ERR, "asic num err![%d]", (which_asic + offset));
                     dev.chain_asic_status_string[which_chain][which_asic+offset] = '\0';
+                    if(((each_chain_h_avg[which_chain]/1000000/10) < (double)(( ASIC_NUM_EACH_CHAIN * dev.frequency * dev.corenum * 0.50) / 40 )) && (!status_error))
+                    {
+                        applog(LOG_NOTICE,"chain %d reinit %0.2f",which_chain,each_chain_h_avg[which_chain]/1000000/10);
+                        info_with_index[which_chain].info = info;
+                        info_with_index[which_chain].chain_index = which_chain;
+                        pthread_create(&reinit_id[which_chain], NULL, bitmain_DASH_reinit_chain, (void *)(&info_with_index[which_chain]));
+                        gMinerStatus_Low_Hashrate = true;
+                    }
+                    else
+                    {
+                        gMinerStatus_Low_Hashrate = false;
+                    }
                 }
             }
-
-            ghs = total_mhashes_done / 1 / total_secs;
-            if((ghs < (double)((dev.chain_num * ASIC_NUM_EACH_CHAIN * dev.frequency * dev.corenum * 0.95) / 40 * 0.8)) && (!status_error))
-            {
-                system("echo \"Rate too low, reboot!!\" >> /usr/bin/already_reboot");
-                gMinerStatus_Low_Hashrate = true;
-                applog(LOG_ERR, "%s: Hash rate too low, please reboot the miner", __FUNCTION__);
-            }
-            else
-            {
-                gMinerStatus_Low_Hashrate = false;
-            }
-
             copy_time(&tv_start, &tv_end);
         }
 
@@ -4096,6 +4306,54 @@ int create_bitmain_check_miner_status_pthread(struct bitmain_DASH_info *info)
 void *get_hash_rate()
 {
     uint32_t which_chain = 0, i = 0;
+    struct timeval old_h, new_h, diff;
+    double each_chain_h[BITMAIN_MAX_CHAIN_NUM][10] = {{0}};
+    double each_chain_h_all = 0;
+    int index[BITMAIN_MAX_CHAIN_NUM] = {0};
+    cgtime(&old_h);
+    cgtime(&new_h);
+
+    while(1)
+    {
+        cgtime(&new_h);
+        timersub(&new_h, &old_h, &diff);
+        each_chain_h_all = 0;
+        for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
+        {
+            if(dev.chain_exist[which_chain])
+            {
+                each_chain_h[which_chain][index[which_chain]] = (double)(h_each_chain[which_chain] * ((1 << 0x1B) -1));
+                h_each_chain[which_chain] = 0;
+                each_chain_h[which_chain][index[which_chain]] = each_chain_h[which_chain][index[which_chain]] / (diff.tv_sec + ((double)(diff.tv_usec + 1) / 1000000));
+                each_chain_h_avg[which_chain] = 0;
+                for( i = 0; i < 10; i++)
+                {
+                    each_chain_h_avg[which_chain]+= each_chain_h[which_chain][i];
+                }
+
+                snprintf(displayed_rate[which_chain],sizeof(displayed_rate[which_chain]),"%.2f",each_chain_h_avg[which_chain]/1000000/10);
+                each_chain_h_all += each_chain_h_avg[which_chain]/1000000/10;
+
+                index[which_chain]++;
+                if (index[which_chain] >= 10)
+                {
+                    index[which_chain] = 0;
+                }
+            }
+        }
+        snprintf(displayed_hash_rate,sizeof(displayed_hash_rate),"%.2f",each_chain_h_all);
+        geach_chain_h_all = each_chain_h_all;
+        copy_time(&old_h,&new_h);
+
+        sleep(READ_HASH_RATE_TIME_GAP);
+    }
+}
+
+
+/*
+void *get_hash_rate()
+{
+    uint32_t which_chain = 0, i = 0;
 
     while(1)
     {
@@ -4113,47 +4371,47 @@ void *get_hash_rate()
 
         calculate_hash_rate();
 
-        /**/
-        for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
-        {
-            if(dev.chain_exist[which_chain])
-            {
-                check_asic_reg(which_chain, 1, 0, CHIP_STATUS);
-            }
-            cgsleep_ms(10);
-        }
 
-        for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
+for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
+{
+    if(dev.chain_exist[which_chain])
+    {
+        check_asic_reg(which_chain, 1, 0, CHIP_STATUS);
+    }
+    cgsleep_ms(10);
+}
+
+for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
+{
+    for(i=0; i<ASIC_NUM_EACH_CHAIN; i++)
+    {
+        if(g_CHIP_STATUS_reg_value[which_chain][i] != 0)
         {
-            for(i=0; i<ASIC_NUM_EACH_CHAIN; i++)
+            if(g_CHIP_STATUS_reg_value[which_chain][i] == 0xffffffff)
             {
-                if(g_CHIP_STATUS_reg_value[which_chain][i] != 0)
-                {
-                    if(g_CHIP_STATUS_reg_value[which_chain][i] == 0xffffffff)
-                    {
-                        applog(LOG_DEBUG, "%s: Chain%d ASIC%02d  didn't receive CHIP_STATUS value", __FUNCTION__, which_chain, i);
-                    }
-                    else
-                    {
-                        applog(LOG_DEBUG, "%s: Chain%d ASIC%02d  g_CHIP_STATUS_reg_value = 0x%08x", __FUNCTION__, which_chain, i, g_CHIP_STATUS_reg_value[which_chain][i]);
-                    }
-                }
+                applog(LOG_DEBUG, "%s: Chain%d ASIC%02d  didn't receive CHIP_STATUS value", __FUNCTION__, which_chain, i);
+            }
+            else
+            {
+                applog(LOG_DEBUG, "%s: Chain%d ASIC%02d  g_CHIP_STATUS_reg_value = 0x%08x", __FUNCTION__, which_chain, i, g_CHIP_STATUS_reg_value[which_chain][i]);
             }
         }
-
-        for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
-        {
-            if(dev.chain_exist[which_chain] == 1)
-            {
-                set_config(dev.dev_fd[which_chain], 1, 0, CHIP_STATUS, 0x80000000);
-                cgsleep_ms(5);
-            }
-        }
-
-        sleep(READ_HASH_RATE_TIME_GAP);
     }
 }
 
+for(which_chain = 0; which_chain < BITMAIN_MAX_CHAIN_NUM; which_chain++)
+{
+    if(dev.chain_exist[which_chain] == 1)
+    {
+        set_config(dev.dev_fd[which_chain], 1, 0, CHIP_STATUS, 0x80000000);
+        cgsleep_ms(5);
+    }
+}
+
+sleep(READ_HASH_RATE_TIME_GAP);
+}
+}
+*/
 
 int create_bitmain_get_hash_rate_pthread(void)
 {
@@ -4430,8 +4688,9 @@ void *DASH_fill_work(void *usrdata)
 {
     pthread_detach(pthread_self());
     applog(LOG_DEBUG, "Start To Fill Work!");
-    struct bitmain_DASH_info *info = (struct bitmain_DASH_info *)usrdata;
-    uint8_t chainid = info->chain_index;
+    struct bitmain_DASH_info_with_index *info_with_chain = (struct bitmian_DASH_info_with_index *)usrdata;
+    struct bitmain_DASH_info *info = info_with_chain->info;
+    uint8_t chainid = info_with_chain->chain_index;
     struct thr_info * thr = info->thr;
     struct timeval send_start, last_send, send_elapsed;
     struct work_dash workdata;
@@ -4455,10 +4714,10 @@ void *DASH_fill_work(void *usrdata)
 
     applog(LOG_DEBUG, "Start To Fill Work!ChainIndex:[%d]", chainid);
 
-    while(1)
+    while(1 && !reiniting[chainid])
     {
 
-        if(!start_send)
+        if(!start_send[chainid])
         {
             cgsleep_ms(10);
             continue;
@@ -4579,7 +4838,7 @@ void *get_asic_response(void* arg)
     applog(LOG_NOTICE, "Start A New Asic Response.Chain Id:[%d]", chainid);
     applog(LOG_DEBUG, "%s %d",__FUNCTION__,chainid);
 
-    while(1)
+    while(start_recv[chainid])
     {
         cgsleep_ms(1);
         len = DASH_read(fd, receive_buf, ASIC_RETURN_DATA_LENGTH*10);
@@ -4614,7 +4873,7 @@ void *get_asic_response(void* arg)
                     if(data_buf[data_buf_rp] != OUTPUT_HEADER_1 || data_buf[use_point_add_1(data_buf_rp,max)] != OUTPUT_HEADER_2)
                     {
                         add_point(&data_buf_rp,max);
-                        applog(LOG_ERR,"%s: %d Headers are not corret! Header0 = 0x%02x, Header1 = 0x%02x, Header2 = 0x%02x rp = %d\n", __FUNCTION__,chainid,data_buf[use_point_sub_1(data_buf_rp,max)],data_buf[data_buf_rp], data_buf[use_point_add_1(data_buf_rp,max)],data_buf_rp);
+                        applog(LOG_DEBUG,"%s: %d Headers are not corret! Header0 = 0x%02x, Header1 = 0x%02x, Header2 = 0x%02x rp = %d\n", __FUNCTION__,chainid,data_buf[use_point_sub_1(data_buf_rp,max)],data_buf[data_buf_rp], data_buf[use_point_add_1(data_buf_rp,max)],data_buf_rp);
                         continue;
                     }
                     else
@@ -4906,7 +5165,7 @@ static struct api_data *bitmain_api_stats(struct cgpu_info *cgpu)
         }
     }
 
-    suffix_string_DASH(hash_rate_all, (char * )displayed_hash_rate, sizeof(displayed_hash_rate), 6,false);
+    //suffix_string_DASH(hash_rate_all, (char * )displayed_hash_rate, sizeof(displayed_hash_rate), 6,false);
 
     return root;
 }
